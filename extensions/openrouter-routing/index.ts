@@ -55,6 +55,20 @@ function persistEnrichedModels(enrichedModelIds: ReadonlySet<string>) {
   }
 }
 
+function readApiKeyFromAuthFile(): string | undefined {
+  try {
+    const authPath = join(homedir(), ".pi", "agent", "auth.json");
+    if (!existsSync(authPath)) return undefined;
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    const entry = auth?.openrouter;
+    if (typeof entry?.key === "string" && entry.key) return entry.key;
+    if (typeof entry?.accessToken === "string" && entry.accessToken) return entry.accessToken;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function clearPersistedEnrichedModels() {
   try {
     // Overwrite with an empty list so stale IDs are never restored.
@@ -198,10 +212,12 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
   // Best-effort restore at load time so persisted variants are registered
   // before Pi resolves the saved default model / scoped patterns.
-  if (loadPersistedEnrichedModels().length > 0 && process.env.OPENROUTER_API_KEY) {
+  // Auth may come from env OR ~/.pi/agent/auth.json (pi /login openrouter).
+  const loadApiKey = process.env.OPENROUTER_API_KEY || readApiKeyFromAuthFile();
+  if (loadPersistedEnrichedModels().length > 0 && loadApiKey) {
     await restoreEnriched(
       {
-        modelRegistry: { getApiKeyForProvider: async () => process.env.OPENROUTER_API_KEY },
+        modelRegistry: { getApiKeyForProvider: async () => loadApiKey },
         ui: { notify: () => {} },
       },
       true,

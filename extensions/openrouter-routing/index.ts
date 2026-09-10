@@ -9,7 +9,7 @@ import {
   type RouteVariant,
 } from "./types.js";
 import { invalidateAllCaches, fetchKeyInfo, fetchCredits, fetchModels, fetchModelEndpoints } from "./api.js";
-import { toProviderModel, groupEndpoints, formatEndpointHealth, parseCost } from "./models.js";
+import { toProviderModel, groupEndpoints, formatEndpointHealth, parseCost, enrichModel } from "./models.js";
 import { createStreamFactory } from "./routing.js";
 import { createModelPicker, rankModelsForQuery } from "./picker.js";
 import {
@@ -17,7 +17,6 @@ import {
   nextGeneration,
   isStale,
   buildPlainSync,
-  buildEnrichedSync,
   commitSnapshot,
   getCachedModelList,
 } from "./state.js";
@@ -188,6 +187,55 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
   // ---------- Core sync logic ----------
 
+  /**
+   * Build a catalog consisting of the full base model list plus the merged
+   * endpoint variants of every model in enrichedIds. Returns null when the
+   * generation became stale (a newer sync started); never throws for
+   * per-model failures — those are counted in endpointFailures.
+   */
+  async function buildMergedCatalog(
+    enrichedIds: string[],
+    apiKey: string | undefined,
+    generation: number,
+  ): Promise<{
+    models: ProviderModelConfig[];
+    routes: Map<string, RouteVariant>;
+    enrichedModelIds: Set<string>;
+    endpointFailures: number;
+  } | null> {
+    // Fetch the base catalog once (cached unless forced elsewhere).
+    const rawModels = await fetchModels(apiKey, false);
+    if (isStale(generation)) return null;
+    const baseModels = rawModels.map(toProviderModel);
+
+    const routes = new Map<string, RouteVariant>();
+    const variants: ProviderModelConfig[] = [];
+    const enrichedModelIds = new Set<string>();
+    let endpointFailures = 0;
+
+    for (const modelId of enrichedIds) {
+      try {
+        const enriched = await enrichModel(rawModels, modelId, apiKey);
+        if (isStale(generation)) return null;
+        for (const [key, route] of enriched.routes) routes.set(key, route);
+        variants.push(...enriched.variants);
+        enrichedModelIds.add(modelId);
+        endpointFailures += enriched.endpointFailures;
+      } catch {
+        // Model vanished from the catalog or endpoints unavailable — skip it
+        // but keep the rest of the merged catalog intact.
+        endpointFailures += 1;
+      }
+    }
+
+    return {
+      models: [...baseModels, ...variants],
+      routes,
+      enrichedModelIds,
+      endpointFailures,
+    };
+  }
+
   async function bootstrapPlainSync() {
     const generation = nextGeneration();
 
@@ -246,16 +294,25 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function syncEnriched(ctx: any, targetModelId: string) {
+  async function syncEnriched(ctx: any, targetModelIds: string[]) {
     const generation = nextGeneration();
 
     try {
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
-      ctx.ui.notify(`Fetching endpoint variants for ${targetModelId}...`, "info");
+      const label = targetModelIds.join(", ");
+      ctx.ui.notify(`Fetching endpoint variants for ${label}...`, "info");
 
-      const result = await buildEnrichedSync(targetModelId, apiKey, false);
+      // Start from the requested set PLUS already-enriched models so an
+      // enrich never silently drops earlier enrichments (or the saved
+      // default model's variants).
+      const mergedIds = new Set<string>([
+        ...loadPersistedEnrichedModels(),
+        ...targetModelIds,
+      ]);
 
-      if (isStale(generation)) return;
+      const result = await buildMergedCatalog(Array.from(mergedIds), apiKey, generation);
+      if (result === null) return;
+
       commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
       registerWithSnapshot(result.models, result.routes);
       persistEnrichedModels(result.enrichedModelIds);
@@ -265,7 +322,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       const enrichedList = Array.from(result.enrichedModelIds).join(", ");
       const totalRegistered = result.models.length;
       ctx.ui.notify(
-        `OpenRouter: ${totalRegistered} models registered (${result.variantCount} variants) [${enrichedList}]${failuresText}`,
+        `OpenRouter: ${totalRegistered} models registered (${result.routes.size} variants) [${enrichedList}]${failuresText}`,
         "info",
       );
     } catch (err: any) {
@@ -273,7 +330,64 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     }
   }
 
+  async function diminishEnriched(ctx: any, targetModelIds: string[]) {
+    const generation = nextGeneration();
+
+    try {
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
+      const label = targetModelIds.join(", ");
+
+      const current = new Set(loadPersistedEnrichedModels());
+      const unknown = targetModelIds.filter((id) => !current.has(id));
+      if (unknown.length > 0) {
+        ctx.ui.notify(
+          `Not enriched (nothing to diminish): ${unknown.join(", ")}`,
+          "warning",
+        );
+        if (unknown.length === targetModelIds.length) return;
+      }
+
+      for (const id of targetModelIds) current.delete(id);
+      ctx.ui.notify(`Removing endpoint variants for ${label}...`, "info");
+
+      if (current.size === 0) {
+        // Nothing left enriched — restore the plain catalog (same as sync).
+        const result = await buildPlainSync(apiKey, false);
+        if (isStale(generation)) return;
+        commitSnapshot(generation, result.models, result.routes);
+        registerWithSnapshot(result.models, result.routes);
+        clearPersistedEnrichedModels();
+        ctx.ui.notify(
+          `OpenRouter: variants removed for ${label}; plain catalog restored (${result.modelCount} models)`,
+          "info",
+        );
+        return;
+      }
+
+      const result = await buildMergedCatalog(Array.from(current), apiKey, generation);
+      if (result === null) return;
+
+      commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
+      registerWithSnapshot(result.models, result.routes);
+      persistEnrichedModels(result.enrichedModelIds);
+
+      ctx.ui.notify(
+        `OpenRouter: variants removed for ${label}; ${result.routes.size} variants remain [${Array.from(result.enrichedModelIds).join(", ")}]`,
+        "info",
+      );
+    } catch (err: any) {
+      ctx.ui.notify(`OpenRouter diminish failed: ${err?.message}`, "error");
+    }
+  }
+
   // ---------- Autocomplete helper ----------
+
+  function parseModelIds(args: string): string[] {
+    return args
+      .split(/[,\s]+/)
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+  }
 
   function modelCompletions(prefix: string) {
     const cached = getCachedModelList();
@@ -289,10 +403,35 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     }));
   }
 
+  function enrichedModelCompletions(prefix: string) {
+    const enriched = getSnapshot().enrichedModelIds;
+    if (enriched.size === 0) return null;
+    const cached = getCachedModelList();
+    const byId = new Map((cached || []).map((m) => [m.id, m]));
+
+    const raw = prefix.trim().toLowerCase();
+    return Array.from(enriched)
+      .filter((id) => id.toLowerCase().includes(raw))
+      .slice(0, 20)
+      .map((id) => ({
+        value: id,
+        label: id,
+        description: byId.get(id)?.name || "enriched model",
+      }));
+  }
+
   // ---------- Interactive picker (overlay modal with fuzzy search) ----------
 
-  async function pickModel(ctx: any, title: string): Promise<string | undefined> {
-    const cached = getCachedModelList();
+  async function pickModel(
+    ctx: any,
+    title: string,
+    candidates?: string[],
+  ): Promise<string | undefined> {
+    let cached = getCachedModelList();
+    if (candidates) {
+      const byId = new Map((cached || []).map((m) => [m.id, m]));
+      cached = candidates.map((id) => byId.get(id) || ({ id, name: id } as any));
+    }
     if (!cached || cached.length === 0) {
       ctx.ui.notify("No models cached. Run /openrouter-sync first.", "warning");
       return undefined;
@@ -331,44 +470,25 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       const plain = await buildPlainSync(apiKey, false);
       if (isStale(generation)) return;
 
-      // Re-enrich each persisted model on top of the fresh catalog.
-      const routes = new Map<string, RouteVariant>();
-      const enrichedModelIds = new Set<string>();
-      let variants: ProviderModelConfig[] = [];
-      let failures = 0;
+      const result = await buildMergedCatalog(persisted, apiKey, generation);
+      if (result === null) return;
 
-      for (const modelId of persisted) {
-        try {
-          const result = await buildEnrichedSync(modelId, apiKey, false);
-          if (isStale(generation)) return;
-          // Keep the last successful buildEnrichedSync output as the base
-          // (it already contains baseModels + that model's variants), then
-          // merge routes from any further enrich attempts.
-          variants = result.models;
-          for (const [key, route] of result.routes) routes.set(key, route);
-          for (const id of result.enrichedModelIds) enrichedModelIds.add(id);
-          failures += result.endpointFailures;
-        } catch {
-          failures += 1;
-        }
-      }
-
-      // Prefer the merged catalog if any enrichment succeeded; otherwise
-      // fall back to the plain catalog so startup never breaks.
-      if (routes.size > 0) {
-        commitSnapshot(generation, variants, routes, enrichedModelIds);
-        registerWithSnapshot(variants, routes);
-        persistEnrichedModels(enrichedModelIds);
+      if (result.routes.size > 0) {
+        commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
+        registerWithSnapshot(result.models, result.routes);
+        persistEnrichedModels(result.enrichedModelIds);
         if (!silent) {
-          const enrichedList = Array.from(enrichedModelIds).join(", ");
+          const enrichedList = Array.from(result.enrichedModelIds).join(", ");
           ctx.ui.notify(
-            `OpenRouter: restored ${routes.size} variants [${enrichedList}]${
-              failures > 0 ? ` (${failures} endpoint failures)` : ""
+            `OpenRouter: restored ${result.routes.size} variants [${enrichedList}]${
+              result.endpointFailures > 0 ? ` (${result.endpointFailures} endpoint failures)` : ""
             }`,
             "info",
           );
         }
       } else {
+        // All persisted enrichments failed — keep the plain catalog so
+        // startup never breaks.
         commitSnapshot(generation, plain.models, plain.routes);
         registerWithSnapshot(plain.models, plain.routes);
       }
@@ -404,20 +524,49 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("openrouter-enrich", {
     description:
-      "Add provider/quantization variants for a model",
+      "Add provider/quantization variants for one or more models (comma-separated); no args opens the picker",
     getArgumentCompletions: modelCompletions,
     handler: async (args, ctx) => {
-      const modelId = args.trim();
+      const modelIds = parseModelIds(args);
 
-      if (!modelId) {
+      if (modelIds.length === 0) {
         const picked = await pickModel(ctx, "Search models to enrich");
         if (!picked) return;
-        await syncEnriched(ctx, picked);
+        await syncEnriched(ctx, [picked]);
         updateStatusBar(ctx);
         return;
       }
 
-      await syncEnriched(ctx, modelId);
+      await syncEnriched(ctx, modelIds);
+      updateStatusBar(ctx);
+    },
+  });
+
+  pi.registerCommand("openrouter-diminish", {
+    description:
+      "Remove provider/quantization variants for one or more enriched models (comma-separated); no args picks from enriched models",
+    getArgumentCompletions: enrichedModelCompletions,
+    handler: async (args, ctx) => {
+      const modelIds = parseModelIds(args);
+
+      if (modelIds.length === 0) {
+        const enriched = getSnapshot().enrichedModelIds;
+        if (enriched.size === 0) {
+          ctx.ui.notify("No enriched models to diminish.", "warning");
+          return;
+        }
+        const picked = await pickModel(
+          ctx,
+          "Search enriched models to diminish",
+          Array.from(enriched),
+        );
+        if (!picked) return;
+        await diminishEnriched(ctx, [picked]);
+        updateStatusBar(ctx);
+        return;
+      }
+
+      await diminishEnriched(ctx, modelIds);
       updateStatusBar(ctx);
     },
   });

@@ -1,3 +1,6 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   OPENROUTER_BASE_URL,
@@ -22,6 +25,44 @@ import {
 const REFERER_HEADER = "https://github.com/olixis/pi-openrouter-plus";
 const APP_TITLE = "pi-openrouter-realtime";
 const OPENROUTER_INFO_MESSAGE_TYPE = "openrouter-info";
+
+// ---------- Enrichment persistence (survive restarts) ----------
+
+const ENRICHED_STATE_PATH = join(homedir(), ".pi", "agent", "openrouter-enriched.json");
+
+function loadPersistedEnrichedModels(): string[] {
+  try {
+    if (!existsSync(ENRICHED_STATE_PATH)) return [];
+    const raw = JSON.parse(readFileSync(ENRICHED_STATE_PATH, "utf8"));
+    const ids = Array.isArray(raw?.enrichedModelIds) ? raw.enrichedModelIds : [];
+    return ids.filter((id: unknown): id is string => typeof id === "string" && id.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function persistEnrichedModels(enrichedModelIds: ReadonlySet<string>) {
+  try {
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      enrichedModelIds: Array.from(enrichedModelIds),
+    };
+    mkdirSync(dirname(ENRICHED_STATE_PATH), { recursive: true });
+    writeFileSync(ENRICHED_STATE_PATH, JSON.stringify(payload, null, 2) + "\n");
+  } catch {
+    // Persistence is best-effort; never break sync over a write failure.
+  }
+}
+
+function clearPersistedEnrichedModels() {
+  try {
+    // Overwrite with an empty list so stale IDs are never restored.
+    persistEnrichedModels(new Set());
+  } catch {
+    // best-effort
+  }
+}
 
 function emitMessage(pi: ExtensionAPI, text: string) {
   pi.sendMessage({
@@ -155,6 +196,18 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
 
   await bootstrapPlainSync();
 
+  // Best-effort restore at load time so persisted variants are registered
+  // before Pi resolves the saved default model / scoped patterns.
+  if (loadPersistedEnrichedModels().length > 0 && process.env.OPENROUTER_API_KEY) {
+    await restoreEnriched(
+      {
+        modelRegistry: { getApiKeyForProvider: async () => process.env.OPENROUTER_API_KEY },
+        ui: { notify: () => {} },
+      },
+      true,
+    );
+  }
+
   async function syncPlain(ctx: any, silent = false, force = false) {
     const generation = nextGeneration();
 
@@ -167,6 +220,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       if (isStale(generation)) return;
       commitSnapshot(generation, result.models, result.routes);
       registerWithSnapshot(result.models, result.routes);
+      clearPersistedEnrichedModels();
 
       if (!silent) {
         ctx.ui.notify(`OpenRouter: ${result.modelCount} models synced`, "info");
@@ -188,6 +242,7 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       if (isStale(generation)) return;
       commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
       registerWithSnapshot(result.models, result.routes);
+      persistEnrichedModels(result.enrichedModelIds);
 
       const failuresText =
         result.endpointFailures > 0 ? `, ${result.endpointFailures} endpoint failures` : "";
@@ -246,13 +301,73 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     return result || undefined;
   }
 
+  // ---------- Restore enriched models on startup ----------
+
+  async function restoreEnriched(ctx: any, silent = false) {
+    const persisted = loadPersistedEnrichedModels();
+    if (persisted.length === 0) return;
+
+    const generation = nextGeneration();
+    try {
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
+
+      // Re-run the plain sync first so the base catalog is fresh.
+      const plain = await buildPlainSync(apiKey, false);
+      if (isStale(generation)) return;
+
+      // Re-enrich each persisted model on top of the fresh catalog.
+      const routes = new Map<string, RouteVariant>();
+      const enrichedModelIds = new Set<string>();
+      let variants: ProviderModelConfig[] = [];
+      let failures = 0;
+
+      for (const modelId of persisted) {
+        try {
+          const result = await buildEnrichedSync(modelId, apiKey, false);
+          if (isStale(generation)) return;
+          // Keep the last successful buildEnrichedSync output as the base
+          // (it already contains baseModels + that model's variants), then
+          // merge routes from any further enrich attempts.
+          variants = result.models;
+          for (const [key, route] of result.routes) routes.set(key, route);
+          for (const id of result.enrichedModelIds) enrichedModelIds.add(id);
+          failures += result.endpointFailures;
+        } catch {
+          failures += 1;
+        }
+      }
+
+      // Prefer the merged catalog if any enrichment succeeded; otherwise
+      // fall back to the plain catalog so startup never breaks.
+      if (routes.size > 0) {
+        commitSnapshot(generation, variants, routes, enrichedModelIds);
+        registerWithSnapshot(variants, routes);
+        persistEnrichedModels(enrichedModelIds);
+        if (!silent) {
+          const enrichedList = Array.from(enrichedModelIds).join(", ");
+          ctx.ui.notify(
+            `OpenRouter: restored ${routes.size} variants [${enrichedList}]${
+              failures > 0 ? ` (${failures} endpoint failures)` : ""
+            }`,
+            "info",
+          );
+        }
+      } else {
+        commitSnapshot(generation, plain.models, plain.routes);
+        registerWithSnapshot(plain.models, plain.routes);
+      }
+    } catch {
+      // Never break startup over a failed restore; plain catalog remains active.
+    }
+  }
+
   // ---------- Auto-sync on session start ----------
 
   pi.on("session_start", async (_event, ctx) => {
     try {
       const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
       if (apiKey) {
-        await syncPlain(ctx, true, true);
+        await restoreEnriched(ctx, true);
         updateStatusBar(ctx);
       }
     } catch {

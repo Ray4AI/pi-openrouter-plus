@@ -299,31 +299,48 @@ function buildVariantModel(
 
 // ---------- Enrichment for a single model ----------
 
+/**
+ * Build provider/quantization variants from already-fetched endpoint data.
+ * Pure and synchronous — used both for live endpoint responses and for
+ * rebuilding variants from the disk cache without touching the network.
+ */
+export function buildEnrichmentFromEndpoints(
+  base: OpenRouterModel,
+  endpoints: OpenRouterEndpoint[],
+): EnrichedResult {
+  const variants: ProviderModelConfig[] = [];
+  const routes = new Map<string, RouteVariant>();
+
+  for (const group of groupEndpoints(base, endpoints)) {
+    variants.push(buildVariantModel(base, group.route, group.endpoints));
+    routes.set(group.route.syntheticId, group.route);
+  }
+
+  return { variants, routes, variantCount: variants.length, endpointFailures: 0 };
+}
+
 export async function enrichModel(
   models: OpenRouterModel[],
   targetModelId: string,
   apiKey?: string,
+  options?: { endpoints?: OpenRouterEndpoint[] },
 ): Promise<EnrichedResult> {
   const targetModel = models.find((m) => m.id === targetModelId);
   if (!targetModel) {
     throw new Error(`OpenRouter model not found: ${targetModelId}`);
   }
 
-  const variants: ProviderModelConfig[] = [];
-  const routes = new Map<string, RouteVariant>();
-  let endpointFailures = 0;
+  // Preloaded endpoints (e.g. restored from the disk cache) skip the fetch.
+  if (options?.endpoints) {
+    return buildEnrichmentFromEndpoints(targetModel, options.endpoints);
+  }
 
   try {
     const endpoints = await fetchModelEndpoints(targetModel.id, apiKey);
-    for (const group of groupEndpoints(targetModel, endpoints)) {
-      variants.push(buildVariantModel(targetModel, group.route, group.endpoints));
-      routes.set(group.route.syntheticId, group.route);
-    }
+    return buildEnrichmentFromEndpoints(targetModel, endpoints);
   } catch {
-    endpointFailures = 1;
+    return { variants: [], routes: new Map(), variantCount: 0, endpointFailures: 1 };
   }
-
-  return { variants, routes, variantCount: variants.length, endpointFailures };
 }
 
 // ---------- Format helpers ----------

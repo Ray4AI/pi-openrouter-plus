@@ -8,8 +8,25 @@ import {
   type ProviderModelConfig,
   type RouteVariant,
 } from "./types.js";
-import { invalidateAllCaches, fetchKeyInfo, fetchCredits, fetchModels, fetchModelEndpoints } from "./api.js";
-import { toProviderModel, groupEndpoints, formatEndpointHealth, parseCost, enrichModel } from "./models.js";
+import {
+  invalidateAllCaches,
+  fetchKeyInfo,
+  fetchCredits,
+  fetchModels,
+  fetchModelEndpoints,
+  getCachedEndpoints,
+  getEndpointCacheSnapshot,
+  seedEndpointCache,
+  seedModelsCache,
+} from "./api.js";
+import {
+  toProviderModel,
+  groupEndpoints,
+  formatEndpointHealth,
+  parseCost,
+  buildEnrichmentFromEndpoints,
+} from "./models.js";
+import { loadCatalogCache, saveCatalogCache, type CatalogCacheFile } from "./cache.js";
 import { createStreamFactory } from "./routing.js";
 import { createModelPicker, rankModelsForQuery } from "./picker.js";
 import {
@@ -75,6 +92,51 @@ function clearPersistedEnrichedModels() {
   } catch {
     // best-effort
   }
+}
+
+// ---------- Catalog cache helpers ----------
+
+function persistCatalogCache() {
+  const models = getCachedModelList();
+  if (!models || models.length === 0) return;
+  saveCatalogCache(models, getEndpointCacheSnapshot());
+}
+
+/**
+ * Rebuild a full catalog (base models + enriched variants) from the disk cache
+ * without any network access. Variants are rebuilt through the same conversion
+ * path as live enrichments, so cached and freshly synced catalogs are
+ * indistinguishable to the rest of the extension.
+ */
+function buildCatalogFromCache(
+  cache: CatalogCacheFile,
+  enrichedIds: string[],
+): {
+  models: ProviderModelConfig[];
+  routes: Map<string, RouteVariant>;
+  enrichedModelIds: Set<string>;
+} {
+  const byId = new Map(cache.models.map((m) => [m.id, m]));
+  const routes = new Map<string, RouteVariant>();
+  const variants: ProviderModelConfig[] = [];
+  const enrichedModelIds = new Set<string>();
+
+  for (const modelId of enrichedIds) {
+    const base = byId.get(modelId);
+    if (!base) continue;
+    const endpoints = cache.endpoints[modelId];
+    if (!endpoints) continue;
+    const enriched = buildEnrichmentFromEndpoints(base, endpoints);
+    for (const [key, route] of enriched.routes) routes.set(key, route);
+    variants.push(...enriched.variants);
+    enrichedModelIds.add(modelId);
+  }
+
+  return {
+    models: [...cache.models.map(toProviderModel), ...variants],
+    routes,
+    enrichedModelIds,
+  };
 }
 
 function emitMessage(pi: ExtensionAPI, text: string) {
@@ -192,85 +254,194 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
    * endpoint variants of every model in enrichedIds. Returns null when the
    * generation became stale (a newer sync started); never throws for
    * per-model failures — those are counted in endpointFailures.
+   *
+   * Endpoint fetches run in parallel. When one fails and last-known endpoints
+   * are available (memory cache, seeded from disk), those are used instead so
+   * previously enriched variants stay resolvable even offline.
    */
   async function buildMergedCatalog(
     enrichedIds: string[],
     apiKey: string | undefined,
     generation: number,
+    opts: { force?: boolean } = {},
   ): Promise<{
     models: ProviderModelConfig[];
     routes: Map<string, RouteVariant>;
     enrichedModelIds: Set<string>;
     endpointFailures: number;
   } | null> {
+    const force = opts.force ?? false;
     // Fetch the base catalog once (cached unless forced elsewhere).
-    const rawModels = await fetchModels(apiKey, false);
+    const rawModels = await fetchModels(apiKey, force);
     if (isStale(generation)) return null;
-    const baseModels = rawModels.map(toProviderModel);
+
+    const byId = new Map(rawModels.map((m) => [m.id, m]));
+    const settled = await Promise.all(
+      enrichedIds.map(async (modelId) => {
+        const base = byId.get(modelId);
+        if (!base) return { modelId, kind: "vanished" as const };
+        try {
+          const endpoints = await fetchModelEndpoints(modelId, apiKey, force);
+          return { modelId, kind: "fresh" as const, base, endpoints };
+        } catch {
+          const fallback = getCachedEndpoints(modelId);
+          if (fallback) return { modelId, kind: "fallback" as const, base, endpoints: fallback };
+          return { modelId, kind: "failed" as const, base };
+        }
+      }),
+    );
+    if (isStale(generation)) return null;
 
     const routes = new Map<string, RouteVariant>();
     const variants: ProviderModelConfig[] = [];
     const enrichedModelIds = new Set<string>();
     let endpointFailures = 0;
 
-    for (const modelId of enrichedIds) {
-      try {
-        const enriched = await enrichModel(rawModels, modelId, apiKey);
-        if (isStale(generation)) return null;
-        for (const [key, route] of enriched.routes) routes.set(key, route);
-        variants.push(...enriched.variants);
-        enrichedModelIds.add(modelId);
-        endpointFailures += enriched.endpointFailures;
-      } catch {
-        // Model vanished from the catalog or endpoints unavailable — skip it
-        // but keep the rest of the merged catalog intact.
+    for (const item of settled) {
+      if (item.kind === "vanished") {
+        // Model vanished from the catalog — skip it but keep the rest of the
+        // merged catalog intact.
         endpointFailures += 1;
+        continue;
       }
+      if (item.kind === "failed") {
+        // Endpoints unreachable and nothing cached: keep the ID so a later
+        // refresh can restore its variants, but register no variants now.
+        endpointFailures += 1;
+        enrichedModelIds.add(item.modelId);
+        continue;
+      }
+      // Fallback restores use last-known endpoints; count them as failures so
+      // sync reports stay transparent about potentially stale variant data.
+      if (item.kind === "fallback") endpointFailures += 1;
+      const enriched = buildEnrichmentFromEndpoints(item.base, item.endpoints);
+      for (const [key, route] of enriched.routes) routes.set(key, route);
+      variants.push(...enriched.variants);
+      enrichedModelIds.add(item.modelId);
     }
 
     return {
-      models: [...baseModels, ...variants],
+      models: [...rawModels.map(toProviderModel), ...variants],
       routes,
       enrichedModelIds,
       endpointFailures,
     };
   }
 
-  async function bootstrapPlainSync() {
+  // ---------- Background catalog refresh (never blocks startup) ----------
+
+  const MIN_AUTO_REFRESH_INTERVAL_MS = 60_000;
+  let refreshInFlight: Promise<void> | null = null;
+  let lastAutoRefreshAt = 0;
+
+  function autoRefreshAllowed(): boolean {
+    // PI_OFFLINE=1 disables startup network operations; manual commands still work.
+    const flag = (process.env.PI_OFFLINE || "").trim().toLowerCase();
+    return flag !== "1" && flag !== "true";
+  }
+
+  /**
+   * Refresh the base catalog and enriched variants from the network, then
+   * re-register the provider and update the disk cache. On failure the current
+   * catalog stays active — the next session (or /openrouter-sync) retries.
+   */
+  async function refreshCatalogFromNetwork(
+    apiKey: string | (() => Promise<string | undefined>) | undefined,
+    opts: { silent: boolean },
+  ): Promise<void> {
     const generation = nextGeneration();
-
     try {
-      // Register the live OpenRouter catalog during extension load so Pi can
-      // resolve saved scoped-model patterns before session_start fires.
-      // The models endpoint is public, and session_start refreshes again with
-      // the configured API key when one is available.
-      const result = await buildPlainSync(process.env.OPENROUTER_API_KEY, true);
+      const key = typeof apiKey === "function" ? await apiKey() : apiKey;
+      const persistedIds = loadPersistedEnrichedModels();
+      const result = await buildMergedCatalog(persistedIds, key, generation, { force: true });
+      if (result === null || result.models.length === 0) return;
 
-      if (isStale(generation)) return;
-      commitSnapshot(generation, result.models, result.routes);
+      commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds, "network");
       registerWithSnapshot(result.models, result.routes);
-    } catch {
-      // Keep startup resilient. If OpenRouter is temporarily unavailable, Pi's
-      // built-in OpenRouter list remains registered and manual /openrouter-sync
-      // can recover later.
+      persistCatalogCache();
+      if (persistedIds.length > 0) persistEnrichedModels(result.enrichedModelIds);
+    } catch (err) {
+      if (!opts.silent) throw err;
     }
   }
 
-  await bootstrapPlainSync();
+  /** Deduplicated, rate-limited auto-refresh used at load and session_start. */
+  function scheduleAutoRefresh(
+    apiKey?: string | (() => Promise<string | undefined>),
+  ): Promise<void> {
+    if (refreshInFlight) return refreshInFlight;
+    if (!autoRefreshAllowed()) return Promise.resolve();
+    if (lastAutoRefreshAt > 0 && Date.now() - lastAutoRefreshAt < MIN_AUTO_REFRESH_INTERVAL_MS) {
+      return Promise.resolve();
+    }
+    refreshInFlight = (async () => {
+      try {
+        await refreshCatalogFromNetwork(apiKey, { silent: true });
+      } finally {
+        lastAutoRefreshAt = Date.now();
+        refreshInFlight = null;
+      }
+    })();
+    return refreshInFlight;
+  }
 
-  // Best-effort restore at load time so persisted variants are registered
-  // before Pi resolves the saved default model / scoped patterns.
+  // ---------- Startup: instant cache restore + background refresh ----------
+
   // Auth may come from env OR ~/.pi/agent/auth.json (pi /login openrouter).
   const loadApiKey = process.env.OPENROUTER_API_KEY || readApiKeyFromAuthFile();
-  if (loadPersistedEnrichedModels().length > 0 && loadApiKey) {
-    await restoreEnriched(
-      {
-        modelRegistry: { getApiKeyForProvider: async () => loadApiKey },
-        ui: { notify: () => {} },
-      },
-      true,
+  const diskCache = loadCatalogCache();
+  const restoreGeneration = nextGeneration();
+
+  if (diskCache) {
+    // Fast path: rebuild and register the catalog from the local cache with no
+    // network access, so Pi can resolve the saved default model and scoped
+    // model patterns (including `@or:` variants) before session_start fires.
+    // The background refresh below updates the catalog shortly after.
+    const cacheTimestampMs = Date.parse(diskCache.updatedAt) || Date.now();
+    seedModelsCache(diskCache.models, cacheTimestampMs);
+    seedEndpointCache(diskCache.endpoints, cacheTimestampMs);
+
+    const restored = buildCatalogFromCache(diskCache, loadPersistedEnrichedModels());
+    commitSnapshot(
+      restoreGeneration,
+      restored.models,
+      restored.routes,
+      restored.enrichedModelIds,
+      "cache",
     );
+    registerWithSnapshot(restored.models, restored.routes);
+  } else {
+    // First run (or unreadable cache): a single blocking sync keeps the old
+    // guarantee that the live catalog is registered before Pi resolves saved
+    // scoped-model patterns at session start — one fetch instead of several.
+    try {
+      const persistedIds = loadPersistedEnrichedModels();
+      const result = await buildMergedCatalog(persistedIds, loadApiKey, restoreGeneration, {
+        force: true,
+      });
+      if (result !== null && result.models.length > 0 && !isStale(restoreGeneration)) {
+        commitSnapshot(
+          restoreGeneration,
+          result.models,
+          result.routes,
+          result.enrichedModelIds,
+          "network",
+        );
+        registerWithSnapshot(result.models, result.routes);
+        persistCatalogCache();
+        if (persistedIds.length > 0) persistEnrichedModels(result.enrichedModelIds);
+        // Fresh data just landed — rate-limit the auto-refresh so the first run
+        // does not immediately fetch the whole catalog again.
+        lastAutoRefreshAt = Date.now();
+      }
+    } catch {
+      // Keep startup resilient. If OpenRouter is temporarily unavailable, Pi's
+      // built-in OpenRouter list remains registered and the background
+      // refresh or manual /openrouter-sync can recover later.
+    }
   }
+
+  scheduleAutoRefresh(loadApiKey);
 
   async function syncPlain(ctx: any, silent = false, force = false) {
     const generation = nextGeneration();
@@ -282,8 +453,9 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       const result = await buildPlainSync(apiKey, force);
 
       if (isStale(generation)) return;
-      commitSnapshot(generation, result.models, result.routes);
+      commitSnapshot(generation, result.models, result.routes, undefined, "network");
       registerWithSnapshot(result.models, result.routes);
+      persistCatalogCache();
       clearPersistedEnrichedModels();
 
       if (!silent) {
@@ -313,8 +485,9 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       const result = await buildMergedCatalog(Array.from(mergedIds), apiKey, generation);
       if (result === null) return;
 
-      commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
+      commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds, "network");
       registerWithSnapshot(result.models, result.routes);
+      persistCatalogCache();
       persistEnrichedModels(result.enrichedModelIds);
 
       const failuresText =
@@ -354,8 +527,9 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
         // Nothing left enriched — restore the plain catalog (same as sync).
         const result = await buildPlainSync(apiKey, false);
         if (isStale(generation)) return;
-        commitSnapshot(generation, result.models, result.routes);
+        commitSnapshot(generation, result.models, result.routes, undefined, "network");
         registerWithSnapshot(result.models, result.routes);
+        persistCatalogCache();
         clearPersistedEnrichedModels();
         ctx.ui.notify(
           `OpenRouter: variants removed for ${label}; plain catalog restored (${result.modelCount} models)`,
@@ -367,8 +541,9 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       const result = await buildMergedCatalog(Array.from(current), apiKey, generation);
       if (result === null) return;
 
-      commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
+      commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds, "network");
       registerWithSnapshot(result.models, result.routes);
+      persistCatalogCache();
       persistEnrichedModels(result.enrichedModelIds);
 
       ctx.ui.notify(
@@ -456,59 +631,26 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
     return result || undefined;
   }
 
-  // ---------- Restore enriched models on startup ----------
-
-  async function restoreEnriched(ctx: any, silent = false) {
-    const persisted = loadPersistedEnrichedModels();
-    if (persisted.length === 0) return;
-
-    const generation = nextGeneration();
-    try {
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
-
-      // Re-run the plain sync first so the base catalog is fresh.
-      const plain = await buildPlainSync(apiKey, false);
-      if (isStale(generation)) return;
-
-      const result = await buildMergedCatalog(persisted, apiKey, generation);
-      if (result === null) return;
-
-      if (result.routes.size > 0) {
-        commitSnapshot(generation, result.models, result.routes, result.enrichedModelIds);
-        registerWithSnapshot(result.models, result.routes);
-        persistEnrichedModels(result.enrichedModelIds);
-        if (!silent) {
-          const enrichedList = Array.from(result.enrichedModelIds).join(", ");
-          ctx.ui.notify(
-            `OpenRouter: restored ${result.routes.size} variants [${enrichedList}]${
-              result.endpointFailures > 0 ? ` (${result.endpointFailures} endpoint failures)` : ""
-            }`,
-            "info",
-          );
-        }
-      } else {
-        // All persisted enrichments failed — keep the plain catalog so
-        // startup never breaks.
-        commitSnapshot(generation, plain.models, plain.routes);
-        registerWithSnapshot(plain.models, plain.routes);
-      }
-    } catch {
-      // Never break startup over a failed restore; plain catalog remains active.
-    }
-  }
-
   // ---------- Auto-sync on session start ----------
 
   pi.on("session_start", async (_event, ctx) => {
-    try {
-      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
-      if (apiKey) {
-        await restoreEnriched(ctx, true);
-        updateStatusBar(ctx);
+    updateStatusBar(ctx);
+    // Fire-and-forget: refresh the catalog in the background so session start
+    // never waits on the network. The refreshed catalog is re-registered and
+    // persisted for the next session when it arrives.
+    void scheduleAutoRefresh(async () => {
+      try {
+        return await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_NAME);
+      } catch {
+        return undefined;
       }
-    } catch {
-      // No auth configured — skip silently
-    }
+    }).then(() => {
+      try {
+        updateStatusBar(ctx);
+      } catch {
+        // Short-lived sessions may be gone by then — ignore.
+      }
+    });
   });
 
   // ---------- Commands ----------
@@ -710,6 +852,14 @@ export default async function openrouterModelsExtension(pi: ExtensionAPI) {
       } else {
         lines.push("Enriched models: none");
       }
+
+      lines.push(
+        `Catalog source: ${
+          snapshot.source === "cache"
+            ? "local cache (background refresh may update it)"
+            : "network"
+        }`,
+      );
 
       if (snapshot.timestamp > 0) {
         const ageMin = Math.round((Date.now() - snapshot.timestamp) / 60000);

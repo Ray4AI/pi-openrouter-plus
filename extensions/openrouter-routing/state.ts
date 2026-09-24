@@ -13,6 +13,7 @@ let currentSnapshot: SyncSnapshot = {
   routes: new Map(),
   enrichedModelIds: new Set(),
   timestamp: 0,
+  source: "network",
 };
 
 let syncGeneration = 0;
@@ -91,6 +92,7 @@ export function commitSnapshot(
   models: ProviderModelConfig[],
   routes: ReadonlyMap<string, RouteVariant>,
   enrichedModelIds?: Set<string>,
+  source: "cache" | "network" = "network",
 ): boolean {
   if (isStale(generation)) return false;
   currentSnapshot = {
@@ -99,6 +101,7 @@ export function commitSnapshot(
     routes,
     enrichedModelIds: enrichedModelIds || new Set(),
     timestamp: Date.now(),
+    source,
   };
   return true;
 }

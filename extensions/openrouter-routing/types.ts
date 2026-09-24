@@ -144,6 +144,8 @@ export interface SyncSnapshot {
   routes: ReadonlyMap<string, RouteVariant>;
   enrichedModelIds: Set<string>;
   timestamp: number;
+  /** Whether this snapshot was rebuilt from the local disk cache or fetched from the network. */
+  source: "cache" | "network";
 }
 
 export interface EndpointCacheEntry {

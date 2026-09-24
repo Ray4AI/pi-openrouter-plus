@@ -13,13 +13,8 @@ import {
 
 let cachedModels: OpenRouterModel[] | null = null;
 let cacheTimestamp = 0;
-let cachedApiKeyHash = "";
+let inflightModels: Promise<OpenRouterModel[]> | null = null;
 const endpointCache = new Map<string, EndpointCacheEntry>();
-
-function hashKey(key?: string): string {
-  if (!key) return "";
-  return key.slice(0, 8) + key.slice(-4);
-}
 
 function makeHeaders(apiKey?: string): Record<string, string> {
   const headers: Record<string, string> = {};
@@ -69,27 +64,38 @@ export function invalidateAllCaches(): void {
 }
 
 export async function fetchModels(apiKey?: string, force = false): Promise<OpenRouterModel[]> {
-  const keyHash = hashKey(apiKey);
-  if (keyHash !== cachedApiKeyHash) {
-    cachedModels = null;
-    cacheTimestamp = 0;
-    cachedApiKeyHash = keyHash;
-  }
-
   const now = Date.now();
   if (!force && cachedModels && now - cacheTimestamp < CACHE_TTL_MS) {
     return cachedModels;
   }
+  // Concurrent callers share one in-flight request instead of racing several
+  // identical fetches (e.g. plain sync + enriched sync at startup).
+  if (inflightModels && !force) {
+    return inflightModels;
+  }
 
-  const res = await fetchWithTimeout(OPENROUTER_MODELS_URL, {
-    headers: makeHeaders(apiKey),
-  });
-  if (!res.ok) throw formatFetchError(res, "OpenRouter models API");
+  // The /models catalog is public and identical with or without an API key, so
+  // the cache is deliberately NOT keyed by the key in use. (Invalidating on key
+  // changes used to trigger a second full 700KB+ fetch whenever the key source
+  // differed between OPENROUTER_API_KEY and ~/.pi/agent/auth.json.)
+  const request = (async () => {
+    const res = await fetchWithTimeout(OPENROUTER_MODELS_URL, {
+      headers: makeHeaders(apiKey),
+    });
+    if (!res.ok) throw formatFetchError(res, "OpenRouter models API");
 
-  const json = (await res.json()) as { data?: OpenRouterModel[] };
-  cachedModels = json.data || [];
-  cacheTimestamp = now;
-  return cachedModels;
+    const json = (await res.json()) as { data?: OpenRouterModel[] };
+    cachedModels = json.data || [];
+    cacheTimestamp = Date.now();
+    return cachedModels;
+  })();
+
+  inflightModels = request;
+  try {
+    return await request;
+  } finally {
+    if (inflightModels === request) inflightModels = null;
+  }
 }
 
 function buildEndpointsUrl(modelId: string): string {
@@ -152,4 +158,34 @@ export async function fetchCredits(apiKey: string): Promise<OpenRouterCreditsInf
 
 export function getCachedModels(): OpenRouterModel[] | null {
   return cachedModels;
+}
+
+/** Seed the in-memory model cache (e.g. from the disk cache at startup). */
+export function seedModelsCache(models: OpenRouterModel[], timestamp: number): void {
+  cachedModels = models;
+  cacheTimestamp = timestamp;
+}
+
+/** Last-known endpoints for a model, if any (memory cache, seeded from disk). */
+export function getCachedEndpoints(modelId: string): OpenRouterEndpoint[] | undefined {
+  return endpointCache.get(modelId)?.endpoints;
+}
+
+/** Seed the in-memory endpoint cache (e.g. from the disk cache at startup). */
+export function seedEndpointCache(
+  endpoints: Record<string, OpenRouterEndpoint[]>,
+  timestamp: number,
+): void {
+  for (const [modelId, value] of Object.entries(endpoints)) {
+    endpointCache.set(modelId, { timestamp, endpoints: value });
+  }
+}
+
+/** Snapshot of the endpoint cache for persisting to disk. */
+export function getEndpointCacheSnapshot(): Record<string, OpenRouterEndpoint[]> {
+  const snapshot: Record<string, OpenRouterEndpoint[]> = {};
+  for (const [modelId, entry] of endpointCache) {
+    snapshot[modelId] = entry.endpoints;
+  }
+  return snapshot;
 }

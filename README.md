@@ -24,13 +24,13 @@ Enriched `@or:*` variant IDs used to be memory-only: if you saved one as your de
 first model in the catalog.
 
 - Enriched model IDs are persisted to `~/.pi/agent/openrouter-enriched.json` after every successful enrich
-- Restored automatically at **extension load** (before pi resolves the saved default model / scoped
-  patterns) and refreshed on `session_start`
-- Load-time restore reads the API key from `OPENROUTER_API_KEY` **or** `~/.pi/agent/auth.json`
-  (covers `pi /login openrouter` setups)
+- Restored at **extension load** from the local catalog cache — instantly and with no network access —
+  before pi resolves the saved default model / scoped patterns, then refreshed in the background
+- A failed or offline restore never forgets enrichment IDs; they come back on the next successful refresh
 - Restore failures degrade silently to the plain catalog — startup never breaks
-- All state lives in that single file; uninstalling the extension leaves no other traces, and
-  reinstalling restores the same enrichment set
+- State lives in `openrouter-enriched.json` plus the disposable `openrouter-catalog-cache.json`
+  (see [Fast startup](#fast-startup-disk-catalog-cache--background-refresh)); deleting the cache
+  file is always safe — it is rebuilt on the next sync
 
 ### Multi-model enrich with merge semantics
 
@@ -46,7 +46,39 @@ Remove the provider/quantization variants of specific enriched models without re
 - With no args, opens the picker restricted to currently enriched models; tab completion lists enriched models only
 - When nothing remains enriched, the plain catalog is restored automatically
 
+### Fast startup: disk catalog cache + background refresh
+
+Startup used to block on two sequential full-catalog downloads (~700KB each) plus per-model endpoint
+fetches before the TUI appeared. The catalog is now cached on disk and restored instantly:
+
+- `~/.pi/agent/openrouter-catalog-cache.json` stores the raw OpenRouter catalog and the endpoint data
+  of enriched models
+- At startup the full catalog (base models + `@or:` variants) is rebuilt from that cache **without any
+  network access**, and a single background refresh re-fetches and re-registers the latest data while
+  the session is already usable
+- The refreshed catalog is persisted for the next session — an offline or slow start simply picks it
+  up on a later run
+- Duplicate fetches are gone: the public `/models` response is no longer re-downloaded when the API
+  key source changes between `OPENROUTER_API_KEY` and `auth.json`, concurrent syncs share one request,
+  and enriched-model endpoint lookups run in parallel
+- Endpoint fetch failures fall back to last-known endpoint data, so previously enriched variants stay
+  resolvable instead of silently disappearing
+- `PI_OFFLINE=1` skips the background refresh entirely; `/openrouter-sync` still forces a fresh fetch
+- The first run after install (no cache yet) performs one blocking sync so saved scoped-model patterns
+  still resolve immediately — measured with pi 0.85: the TUI appears in ~2s instead of ~3.5s on the
+  first run and within ~0.6s on every warm start
+
 ---
+
+## What's New (fork)
+
+- **Fast startup via a disk catalog cache** — models and enriched variants are restored from
+  `~/.pi/agent/openrouter-catalog-cache.json` with zero network round-trips; a background refresh
+  updates the catalog afterwards
+- **No more duplicate startup fetches** — the public model list is fetched once per refresh instead of
+  two or three times (previously triggered whenever the API key came from a different source)
+- **Resilient enrichment restore** — endpoint lookup failures fall back to last-known endpoint data
+  instead of dropping variants, and an offline startup no longer forgets enriched models
 
 ## What's New in v0.3.7
 
